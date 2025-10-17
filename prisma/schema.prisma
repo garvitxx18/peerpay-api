@@ -1,0 +1,165 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+//// EXISTING TABLES (fixed with relations)
+// This table contains check constraints and requires additional setup for migrations.
+model app_user {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone_e164    String?  @unique
+  display_name  String?
+  upi_vpa       String?  @unique
+  upi_verified  Boolean  @default(false)
+  base_currency String   @default("INR") @db.Char(3)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @default(now()) @db.Timestamptz(6)
+
+  // --- RELATIONS (opposite sides) ---
+  // groups where this user is admin
+  admin_groups grp[] @relation("grp_admin")
+
+  // memberships in groups
+  memberships group_member[]
+
+  // expenses paid by this user
+  expenses_paid expense[] @relation("expense_payer")
+
+  // settlements as payer / payee
+  settlements_payer settlement[] @relation("settlement_payer")
+  settlements_payee settlement[] @relation("settlement_payee")
+
+  // refresh sessions
+  sessions user_session[]
+}
+
+model phone_otp {
+  id            BigInt   @id @default(autoincrement())
+  phone_e164    String
+  code_hash     String
+  expires_at    DateTime @db.Timestamptz(6)
+  attempt_count Int      @default(0)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([expires_at], map: "idx_phone_otp_exp")
+  @@index([phone_e164], map: "idx_phone_otp_phone")
+}
+
+model user_session {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id            String   @db.Uuid
+  refresh_token_hash String
+  created_at         DateTime @default(now()) @db.Timestamptz(6)
+  expires_at         DateTime @db.Timestamptz(6)
+
+  // relation to user
+  user app_user @relation(fields: [user_id], references: [id])
+
+  @@index([user_id], map: "idx_user_session_user")
+  @@index([expires_at], map: "idx_user_session_exp")
+}
+
+//// NEW TABLES
+
+model grp {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  admin_id      String   @db.Uuid
+  profile_emoji String?
+  currency      String   @default("INR") @db.Char(3)
+
+  // per-group interest policy
+  interest_active  Boolean @default(false)
+  apr_bps          Int     @default(0) // 1200 = 12.00%
+  grace_days       Int     @default(0)
+  start_after_days Int     @default(0)
+  compounding      String  @default("none") // none|daily|monthly
+  cap_pct          Int?
+
+  // relations
+  admin       app_user       @relation("grp_admin", fields: [admin_id], references: [id])
+  members     group_member[]
+  expenses    expense[]
+  settlements settlement[]
+
+  @@index([admin_id], map: "idx_grp_admin")
+}
+
+model group_member {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id  String   @db.Uuid
+  user_id   String   @db.Uuid
+  role      String   @default("member")
+  joined_at DateTime @default(now()) @db.Timestamptz(6)
+  upi_vpa   String?
+
+  group  grp             @relation(fields: [group_id], references: [id])
+  user   app_user        @relation(fields: [user_id], references: [id])
+  splits expense_split[]
+
+  @@unique([group_id, user_id], map: "uq_group_member")
+  @@index([user_id], map: "idx_group_member_user")
+  @@index([group_id], map: "idx_group_member_group")
+}
+
+model expense {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id     String   @db.Uuid
+  payer_id     String   @db.Uuid
+  description  String
+  amount_minor BigInt
+  currency     String   @default("INR") @db.Char(3)
+  spent_at     DateTime @db.Timestamptz(6)
+  created_at   DateTime @default(now()) @db.Timestamptz(6)
+  note         String?
+
+  group  grp             @relation(fields: [group_id], references: [id])
+  payer  app_user        @relation("expense_payer", fields: [payer_id], references: [id])
+  splits expense_split[]
+
+  @@index([group_id, spent_at], map: "idx_expense_group_spent")
+  @@index([payer_id], map: "idx_expense_payer")
+}
+
+model expense_split {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  expense_id  String   @db.Uuid
+  member_id   String   @db.Uuid
+  share_minor BigInt
+  method      String   @default("equal")
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+
+  expense expense      @relation(fields: [expense_id], references: [id])
+  member  group_member @relation(fields: [member_id], references: [id])
+
+  @@index([expense_id], map: "idx_expense_split_expense")
+  @@index([member_id], map: "idx_expense_split_member")
+}
+
+model settlement {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id        String   @db.Uuid
+  payer_id        String   @db.Uuid // sender
+  payee_id        String   @db.Uuid // receiver
+  amount_minor    BigInt
+  currency        String   @default("INR") @db.Char(3)
+  client_txn_ref  String   @unique
+  upi_txn_id      String?
+  approval_ref_no String?
+  status          String   @default("SUCCESS") // SUCCESS|SUBMITTED|FAILURE|UNKNOWN
+  note            String?
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+
+  group grp      @relation(fields: [group_id], references: [id])
+  payer app_user @relation("settlement_payer", fields: [payer_id], references: [id])
+  payee app_user @relation("settlement_payee", fields: [payee_id], references: [id])
+
+  @@index([group_id, created_at], map: "idx_settlement_group_created")
+  @@index([payer_id], map: "idx_settlement_payer")
+  @@index([payee_id], map: "idx_settlement_payee")
+}
